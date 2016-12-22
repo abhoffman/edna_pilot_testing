@@ -1,0 +1,429 @@
+---
+title: "Brand Tracking Template"
+output: html_document
+params:
+  brand_name: "Talk Show The Game Show"
+  wave_year: "2016"
+---
+
+``` {r libraries}
+library(knitr)
+library(rmarkdown)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(psqlfun)
+library(lme4)
+library(MuMIn)
+library(ggplot2)
+library(xlsx)
+library(proxy)
+library(pvclust)
+library(cluster)
+library(lazyeval)
+library("stringdist")
+```
+
+```{r setup_data}
+brand_name <- "Adult Swim"
+params <- lis
+params$wave_year <- "2016"
+ 
+raw_data_folder <- paste0("raw_data/", brand_name,"/")
+processed_data_folder <- paste0("processed_data/", brand_name, "/")
+unlink(processed_data_folder,recursive = TRUE)
+dir.create(processed_data_folder)
+wave_name <- paste0(brand_name, " ", params$wave_year)
+
+temp_fmid <- data.frame(name = c(brand_name), fmid = as.character(c(-1) ) )
+
+#dimension order
+dim_order <- data.frame(dimension = c("adrenaline", "edge", "gravity", "heart", "originality", "passion", "relatability"),
+                        order  = c(5, 8,1, 3,4,7, 2), stringsAsFactors = FALSE ) %>% arrange(order)
+use_adjustments <- FALSE
+
+model_list1.1 <-readRDS("/home/aaron/Prep TV 1.2/data1.2/model_list1.1.rds")
+
+#file.path1 <- "/home/aaron/TruTV Pilot Those Who Cant/Those who cant201.xlsx"
+file.path1 <- paste0(raw_data_folder, "/", brand_name, " ", params$wave_year, ".xlsx")
+
+#this_database_folder <- ("~/this_database/")
+
+```
+
+```{r adjustments}
+
+#default is to not adjust
+att_adj <- 1
+eval_adj <- 1
+
+#these adjustments are based on how pilots generally performed in test versus in real life (i.e., wave data)
+if(use_adjustments){
+att_adj <- .64
+eval_adj <- .89}
+
+```
+
+
+```{r get_this_data}
+
+this_data <- read.xlsx(file.path1,1, stringsAsFactors = FALSE) %>% 
+  gather(group, value, -name, -measure_grp, -attribute) 
+
+write.xlsx(data.frame(this_data),paste0(processed_data_folder,"/", brand_name, " unadjusted_attributes.xlsx") )
+```
+
+``` {r load_needed_tables}
+
+con_general <- conn2_psql(username = "process", db_host = "172.24.16.194")
+
+wave_db  <- tbl ( con_general, sql('select * from edna.wave') ) %>% select(wave_id = id, code = code)
+entity_db  <- tbl ( con_general, sql('select * from edna.entity') ) %>% select(fmid, name, entity_type_id)
+
+dimensions_pnorm_db <-  tbl(con_general, sql('select * from prd_tv.measures_long')) %>% 
+  filter(wave == "3.1", measure != "n") %>% 
+  filter(grp_lab == "total") %>%  
+  filter (measure_grp == "dimension" & metric == "raw" )  %>% 
+  select(fmid, name, network_type, genre, wave,measure_grp, metric, measure, value, entity_type_id)
+
+dimensions_db <-  tbl(con_general, sql('select * from prd_tv.measures_long')) %>% 
+  filter(wave == "3.1", measure != "n") %>% 
+  filter(grp_lab == "total") %>%  
+  filter (measure_grp == "dimension" & metric == "normalized" )  %>% 
+  select(fmid, name, network, genre, wave,measure_grp, metric, measure, value, entity_type_id)
+
+evaluations_db <-  tbl(con_general, sql('select * from prd_tv.re_evaluation')) %>% 
+  left_join(entity_db) %>% 
+  left_join(wave_db %>% rename(wave = code)) %>% 
+  filter(wave == "3.1") %>%
+  group_by(fmid, name) %>% 
+  summarize(evaluation = mean(evaluation))
+  
+attributes_db <-  tbl(con_general, sql('select * from prd_tv.measures_long')) %>% 
+  filter(wave == "3.1", measure != "n") %>% 
+  filter(grp_lab == "total") %>%  
+  filter(measure_grp == "attributes" & metric %in% c("pctrank", "raw"  ) ) %>%
+  filter(entity_type_id == 2) %>% 
+  select(fmid, name, network, genre, wave,measure_grp, metric, measure, value, entity_type_id)
+```
+
+
+```{r collect_tbls} 
+dimension_wide <- dimensions_db %>% 
+  filter(measure_grp == "dimension") %>% 
+  collect(n = Inf) %>% 
+  spread(measure, value)
+
+dimension_pnorm_wide <- dimensions_pnorm_db %>% 
+  filter(measure_grp == "dimension") %>% 
+  collect(n = Inf) %>% 
+  mutate(value = round(value,2)) %>% 
+  spread(measure, value)
+
+evaluations <- evaluations_db %>% 
+  select(fmid, name, evaluation) %>% collect(n = Inf)
+
+attributes_col <- attributes_db %>% 
+  filter(metric == "raw") %>% 
+  collect(n = Inf)
+
+```
+
+
+```{r functions_for_testing}
+# get attribute nmames to conform to what we have in our model list
+
+model_vars <- all.vars(formula(model_list1.1[[1]]))
+model_vars <- model_vars[2:length(model_vars)]
+
+replace_closest <- function(df, model_vars, colstr, maxDist = 4)
+{
+  
+  df<-ungroup(df)
+  
+  convert_vars <- df %>% 
+    count_(colstr) %>%
+    select_(colstr) %>% 
+    mutate_(.dots = setNames(list(interp(~x[amatch(a, x, maxDist =m)], a = as.name(colstr), x= model_vars,m = maxDist )), "closest"))
+
+  convert_vars <- df %>% 
+    count_(colstr) %>%
+    select_(colstr) %>% 
+    mutate_(closest= interp(~model_vars[amatch(colstr, model_vars, maxDist =maxDist)], colstr=as.name(colstr)))
+  
+  df <- df %>% 
+    left_join(convert_vars) %>% 
+    mutate_(.dots  = setNames("closest",colstr) ) %>% 
+    select(-closest)
+  
+  return(df)
+}
+
+
+get_coefficients <- function(m ){
+  return(m$coefficients)
+}
+
+
+mutate_fn <- function(d_in, op_ls,var_vec){
+  
+  d_out = d_in %>%
+    mutate_(.dots = setNames(op_ls,var_vec))
+}
+```
+
+
+```{r calculate_pilot_values}
+
+this_data_evaluation <- this_data %>% 
+  filter(measure_grp == "evaluation") %>% 
+  select(name, group, attribute, value) %>% 
+  separate(attribute, convert = TRUE,  into = c("measure", "eval_weight") ) %>% 
+  group_by(name, group, measure) %>% 
+  summarize(value = sum(eval_weight*value)) %>% 
+  mutate(measure = "evaluation", wave = wave_name) %>% 
+  mutate(value = (eval_adj * value))
+  
+this_data_attributes <- this_data %>% 
+  filter(measure_grp == "attribute") %>% 
+  select(name, group, attribute, value) %>% 
+  mutate(value = att_adj *value)
+
+this_data_attributes<- replace_closest(this_data_attributes, model_vars, "attribute")
+
+this_data_attributes_wide <- this_data_attributes %>%
+  spread(attribute, value)
+
+predictions <- lapply(model_list1.1, function(x) predict(x,  this_data_attributes_wide )) %>% data.frame()
+
+this_data_dimensions <- cbind(this_data_attributes_wide %>% select(name, group), predictions) %>% 
+  gather(measure, value, -group, -name) %>% 
+  mutate(wave = wave_name)
+
+this_data_dimensions_pnorm <- this_data_dimensions %>% 
+  mutate(value = round(pnorm(value),4) ) %>% 
+  mutate(wave = wave_name)
+
+dim_contribution <- function (attribute_df) {
+coefficient_mat <-  lapply(model_list1.1, function(x) get_coefficients(x)) %>% data.frame() %>% 
+  data.frame(attribute = rownames(.), .) %>% 
+  gather(dimension, weight, -attribute) %>% 
+  mutate(attribute = as.character(attribute))
+
+intercept_val <- attribute_df[1,] %>% 
+  mutate(attribute="(Intercept)", value = 1)
+
+attribute_df <-rbind(intercept_val, attribute_df )
+
+dim_contribute <- coefficient_mat %>% 
+  left_join(attribute_df) %>% 
+  mutate(contribution = weight*value) %>% 
+  select(attribute, dimension, name, group, contribution) %>% 
+  spread(dimension, contribution)
+
+return(dim_contribute)
+}
+
+```
+
+
+```{r do_dim_contribution}
+
+dim_contribution_df <- this_data_attributes %>% 
+  split(., this_data_attributes$name) %>% 
+  map(~dim_contribution(.) ) %>% 
+  bind_rows()
+```
+
+```{r do_proximities}
+
+this_data_dimensions_wide  <- this_data_dimensions %>% 
+  spread(measure, value) %>% 
+  mutate(entity_type_id = 2)
+# 
+# e_dimensions <- bind_rows(this_data_dimensions_wide, dimension_wide %>% filter(entity_type_id ==2) )
+# 
+# e_dimensions_vals <- e_dimensions %>% 
+#   select(adrenaline, edge, gravity, heart, originality, passion, relatability, smarts) 
+# 
+# sim_matrix <- simil(e_dimensions_vals, 
+#   method = "cosine", by_rows = TRUE, diag = TRUE   ) %>% 
+#   as.matrix(diag = TRUE) 
+# 
+# e_dimensions <-  e_dimensions %>% 
+#   mutate(name = ifelse(name =="Vice" & is.na(network), "Vice Network", name))
+# 
+# proximities_df<- cbind(e_dimensions %>% select(name),  sim_matrix)
+# colnames(proximities_df) <- c("name", e_dimensions %>% select(name) %>% unlist() ) %>% 
+# 
+# proximities_df_out <- proximities_df %>% 
+# select_(.dots = c("name",  "genre" , "network", paste0("`", brand_name, "`") ) )
+
+
+# write.xlsx(proximities_df_out, paste0(processed_data_folder,"/", brand_name," Proximities.xlsx" ) )
+
+```
+
+```{r write_dimensions_to_file}
+####Write Dimensions and attributes to file
+this_data_dimensions_wide_pnorm  <- this_data_dimensions_pnorm %>% 
+  mutate(value = round(value*100,2) )%>% 
+  spread(measure, value) %>% 
+  mutate(entity_type_id = 2)
+
+#e_dimensions <- bind_rows(this_data_dimensions_wide_pnorm, dimension_pnorm_wide )
+# 
+# op_ls <- list(interp(~f(-var1), .values = list(f = as.name("rank"),
+#                                               var1 = as.name(brand_name)) ) )
+# var_vec <- c("rk")
+# 
+# most_proximate_shows <- proximities_df_out %>%
+#   filter( genre == this_data_genre)  %>%
+#   mutate(entity_type = ifelse(is.na(network), "network", "show")) %>%
+#   group_by(entity_type) %>%
+#   mutate_fn(op_ls, var_vec) %>%
+#   arrange((rk)) %>%
+#   filter(rk < 30)
+# 
+# this_data_attributes_mod <- this_data_attributes %>% 
+#   rename(measure = attribute) %>% 
+#   mutate(value  = value * 100, 
+#          entity_type_id = 2,
+#          measure_grp = "attributes") 
+# 
+# all_attributes <-  bind_rows(this_data_attributes_mod, 
+#                             attributes_col) %>% 
+#    group_by(entity_type_id, measure) %>% 
+#    mutate(prk = round(100*percent_rank(value), 2) ) %>% 
+#    ungroup() %>%
+#    mutate(name = ifelse(name == "Vice" & is.na(network), "ViceNetwork", name) ) %>% 
+#    select(name, measure, prk) %>% 
+#    spread(measure, prk)
+# 
+# dimension_table <- most_proximate_shows %>% select(name) %>% 
+#   left_join(e_dimensions, by = c("name")) %>% ungroup() %>% 
+#   arrange(desc(entity_type)) %>% 
+#   select(name, Gravity = gravity, Relatability = relatability, Heart = heart, Originality = originality, Adrenaline= adrenaline, Smarts = smarts, Passion = passion, Edge = edge) 
+#   
+# 
+# kable(dimension_table)
+# write.xlsx(dimension_table, paste0(processed_data_folder,"/", brand_name, "Dimensions.xlsx") )
+# 
+# kable(most_proximate_shows)
+# write.xlsx(data.frame(most_proximate_shows),  paste0(processed_data_folder,"/", brand_name," Closest Proximities.xlsx")  )
+
+write.xlsx(this_data_dimensions_wide_pnorm, paste0(processed_data_folder,"/", brand_name, " Dimensions.xlsx") )
+
+```
+
+```{r write_all_proximities_to_file}
+####Write Dimensions and attributes to file
+# 
+# proximate_shows <- proximities_df_out %>%
+#   mutate(entity_type = ifelse(is.na(network), "network", "show")) 
+# 
+# write.xlsx(proximate_shows,  paste0(processed_data_folder,"/", brand_name," All Proximities.xlsx")  )
+```
+
+```{r write_evals_to_file}
+# all_evals <-bind_rows(this_data_evaluation %>% rename(evaluation = value), evaluations)
+# 
+# evaluations_table <- most_proximate_shows %>% select(name) %>% 
+#   left_join(all_evals, by = c("name")) %>% ungroup() %>% 
+#   select(name, evaluation)
+# 
+# kable(evaluations_table)
+# write.xlsx(evaluations_table,  paste0(processed_data_folder,"/", brand_name," evaluations.xlsx") )
+write.xlsx(this_data_evaluation %>% ungroup(),  paste0(processed_data_folder,"/", brand_name," evaluations.xlsx") )
+```
+
+```{r write_attributes_to_file}
+# 
+# attribute_table <- most_proximate_shows %>% select(name, rk) %>% 
+#   left_join(all_attributes, by = c("name")) %>% ungroup() %>% 
+#   filter(entity_type == "show", rk < 11) %>% 
+#   ungroup() %>% 
+#   select(-entity_type) %>% 
+#   gather(attribute, value, -name, -rk) %>% 
+#   spread(attribute, value) %>% 
+#   arrange(rk)
+# 
+# kable(attribute_table)
+# write.xlsx(attribute_table,  paste0(processed_data_folder,"/", brand_name," attributes percent_rank.xlsx") )
+
+```
+
+```{r write_dimension_contributions_to_file}
+
+###dimension contribution
+
+my_write.xlsx <- function(df, wb_name, sN) {
+  
+  if(!file.exists(wb_name)) {write.xlsx(df, wb_name, sheetName = sN, row.names = FALSE)}
+  else{write.xlsx(df, wb_name, append = TRUE, sheetName = sN, row.names = FALSE)
+    
+  }
+  
+}
+# 
+# names(dim_contribution_df) %>% 
+#   map(~my_write.xlsx(dim_contribution_df[[.]], paste0(processed_data_folder,"/", brand_name, "dimension_contributions.xlsx"), . ))
+
+write.xlsx(dim_contribution_df, paste0(processed_data_folder,"/", brand_name, " dimension_contributions.xlsx") )
+
+
+kable(dim_contribution_df)
+
+
+```
+
+```{r update_rds_file, eval = FALSE}
+append_rds_data <- function(file_name, df_to_append){
+  df <- readRDS(file_name)
+  df.new <- rbind(df, df_to_append)
+  saveRDS(df.new, file_name)
+}
+
+remove_rds_data <- function(file_name, name, wave){
+  df <- readRDS(file_name)
+  this_data_identifier_df <- data.frame(name = name, wave= wave)
+  df.new <-df %>%  anti_join(this_data_identifier_df)
+  saveRDS(df.new, file_name)
+}
+
+unique_append_rds <- function(file_name, df_to_append, name, wave){
+remove_rds_data(file_name, name, wave)
+append_rds_data(file_name, df_to_append)
+}
+
+```
+
+
+```{r save_this_data_raw_dimensions_results}
+this_data_dimensions_out <- this_data_dimensions 
+this_data_attributes_out <- this_data_attributes %>% 
+  mutate(wave = wave_name)
+# this_data_attributes_percent_rank_out <- all_attributes %>% 
+#   mutate(wave = wave_name, genre = this_data_genre) %>% 
+#   filter(name == brand_name)
+this_data_evaluation_out <- this_data_evaluation
+
+# saveRDS(this_data_dimensions_out, paste0(this_database_folder, "r_this_data_dimensions.rds") )
+# saveRDS(this_data_attributes_out, paste0(this_database_folder, "r_this_data_attributes.rds") )
+# saveRDS(this_data_evaluation_out, paste0(this_database_folder, "r_this_data_evaluation.rds") )
+# saveRDS(this_data_attributes_percent_rank_out, paste0(this_database_folder, "r_this_data_attributes_pr.rds") )
+# 
+# unique_append_rds(paste0(this_database_folder, "r_this_data_dimensions.rds"), this_data_dimensions_out, brand_name, wave_name)
+# unique_append_rds(paste0(this_database_folder, "r_this_data_attributes.rds"), this_data_attributes_out, brand_name, wave_name)
+# unique_append_rds(paste0(this_database_folder, "r_this_data_evaluation.rds"), this_data_evaluation_out, brand_name, wave_name)
+# unique_append_rds(paste0(this_database_folder, "r_this_data_attributes_pr.rds"), this_data_attributes_percent_rank_out, brand_name, wave_name)
+
+
+# y1 <- readRDS(paste0(this_database_folder, "r_this_data_dimensions.rds"))
+# y2 <- readRDS(paste0(this_database_folder, "r_this_data_attributes.rds"))
+# y3 <- readRDS(paste0(this_database_folder, "r_this_data_evaluation.rds"))
+
+
+
+```
+
