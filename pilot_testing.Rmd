@@ -22,7 +22,7 @@ rmarkdown::render("Pilot Analysis.Rmd", params = list(pilot_name = "Those who ca
 rmarkdown::render("Pilot Analysis.Rmd", params = list(pilot_name = "Im Sorry", pilot_genre = "Comedy",  wave_year = "2016"))
 
 
-rmarkdown::render("Pilot Analysis.Rmd", params = list(pilot_name = "Claws", pilot_genre = "Drama",  wave_year = "2016" ))
+rmarkdown::render("Pilot Analysis.Rmd", params = list(pilot_name = "Claws", pilot_genre = "Drama",  wave_year = "2016", pilot_network = "TNT" ))
 
 ```
 
